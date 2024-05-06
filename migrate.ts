@@ -61,7 +61,9 @@ const whereDatasetsOverlap = (persystem: string, sum: string) =>
   })`;
 
 const whereDatasetsDontOverlap = (persystem: string, sum: string) =>
-  `${whereDatasetIs(persystem)} AND x NOT IN (SELECT x ${whereDatasetIs(sum)})`;
+  `${whereDatasetIs(persystem)} AND x NOT IN (SELECT x FROM ${TABLE} ${
+    whereDatasetIs(sum)
+  })`;
 
 const exists = (where: string) =>
   `SELECT EXISTS(SELECT 1 FROM ${TABLE} ${where}) AS result;`;
