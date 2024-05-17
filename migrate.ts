@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Database } from "bun:sqlite";
+import { Database, constants } from "bun:sqlite";
 
 if (Bun.argv.length !== 3) {
   console.log("Usage:");
@@ -14,6 +14,8 @@ if (!await Bun.file(path).exists()) {
   console.log(`File does not exist: ${path}`);
   process.exit(1);
 }
+
+const millisInDay = 24 * 60 * 60_000;
 
 const TABLE = "TimeSeries";
 
@@ -56,13 +58,11 @@ const whereDatasetIs = (dataset: string) =>
   `WHERE dataset = ${dataset} AND variant = 'default'`;
 
 const whereDatasetsOverlap = (persystem: string, sum: string) =>
-  `${whereDatasetIs(persystem)} AND x IN (SELECT x FROM ${TABLE} ${
-    whereDatasetIs(sum)
+  `${whereDatasetIs(persystem)} AND x IN (SELECT x FROM ${TABLE} ${whereDatasetIs(sum)
   })`;
 
 const whereDatasetsDontOverlap = (persystem: string, sum: string) =>
-  `${whereDatasetIs(persystem)} AND x NOT IN (SELECT x FROM ${TABLE} ${
-    whereDatasetIs(sum)
+  `${whereDatasetIs(persystem)} AND x NOT IN (SELECT x FROM ${TABLE} ${whereDatasetIs(sum)
   })`;
 
 const exists = (where: string) =>
@@ -72,56 +72,102 @@ const updateDataset = (newDataset: string, where: string) =>
   `UPDATE ${TABLE} SET dataset = ${newDataset} ${where};`;
 
 {
-  using db = new Database(path);
+  const db = new Database(path);
+  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
 
-  type Params = { $persystem: Dataset; $sum: Dataset };
-  using overlapExists = db.query<{ result: boolean }, Params>(
-    exists(whereDatasetsOverlap("$persystem", "$sum")),
-  );
-  using nonOverlapingExists = db.query<{ result: boolean }, Params>(
-    exists(whereDatasetsDontOverlap("$persystem", "$sum")),
-  );
-  using deleteOverlaping = db.query<void, Params>(
-    deleteAll(whereDatasetsOverlap("$persystem", "$sum")),
-  );
-  using updateNonOverlaping = db.query<void, Params>(
-    updateDataset("$sum", whereDatasetsDontOverlap("$persystem", "$sum")),
-  );
+  // Merge legacy and new datasets
+  {
+    type Params = { $persystem: Dataset; $sum: Dataset };
+    using overlapExists = db.query<{ result: boolean }, Params>(
+      exists(whereDatasetsOverlap("$persystem", "$sum")),
+    );
+    using nonOverlapingExists = db.query<{ result: boolean }, Params>(
+      exists(whereDatasetsDontOverlap("$persystem", "$sum")),
+    );
+    using deleteOverlaping = db.query<void, Params>(
+      deleteAll(whereDatasetsOverlap("$persystem", "$sum")),
+    );
+    using updateNonOverlaping = db.query<void, Params>(
+      updateDataset("$sum", whereDatasetsDontOverlap("$persystem", "$sum")),
+    );
 
-  for (const [$persystem, $sum] of correspondingMetrics) {
-    console.log(`🚨 Checking datasets ${$persystem} & ${$sum}.`);
+    for (const [$persystem, $sum] of correspondingMetrics) {
+      console.log(`🚨 Checking datasets ${$persystem} & ${$sum}.`);
 
-    if (overlapExists.get({ $persystem, $sum })?.result) {
-      console.log(`👷 Overlap between 'default' and 'Sum' exists.`);
-      console.log(`👷 Removing overlaping 'default' rows...`);
-
-      deleteOverlaping.run({ $persystem, $sum });
       if (overlapExists.get({ $persystem, $sum })?.result) {
-        console.log("❌ Failed to remove overlap. This was unexpected.");
-        process.exit(1);
+        console.log(`👷 Overlap between 'default' and 'Sum' exists.`);
+        console.log(`👷 Removing overlaping 'default' rows...`);
+
+        deleteOverlaping.run({ $persystem, $sum });
+        if (overlapExists.get({ $persystem, $sum })?.result) {
+          console.log("❌ Failed to remove overlap. This was unexpected.");
+          process.exit(1);
+        } else {
+          console.log("✅ Overlap successfully removed.");
+        }
       } else {
-        console.log("✅ Overlap successfully removed.");
+        console.log("✅ There is no overlap.");
       }
-    } else {
-      console.log("✅ There is no overlap.");
-    }
 
-    if (nonOverlapingExists.get({ $persystem, $sum })?.result) {
-      console.log(`👷 Legacy 'default' variant exist.`);
-      console.log(`👷 Converting to newer metric...`);
-
-      updateNonOverlaping.run({ $persystem, $sum });
       if (nonOverlapingExists.get({ $persystem, $sum })?.result) {
-        console.log(
-          "❌ Failed to convert legacy variant. This was unexpected.",
-        );
-        process.exit(1);
+        console.log(`👷 Legacy 'default' variant exist.`);
+        console.log(`👷 Converting to newer metric...`);
+
+        updateNonOverlaping.run({ $persystem, $sum });
+        if (nonOverlapingExists.get({ $persystem, $sum })?.result) {
+          console.log(
+            "❌ Failed to convert legacy variant. This was unexpected.",
+          );
+          process.exit(1);
+        } else {
+          console.log("✅ Legacy variant successfully converted.");
+        }
       } else {
-        console.log("✅ Legacy variant successfully converted.");
+        console.log("✅ There is no legacy 'default' variant.");
       }
-    } else {
-      console.log("✅ There is no legacy 'default' variant.");
+      console.log();
     }
-    console.log();
+  }
+
+  // Day alignment fix
+  {
+    const datasets = db.query<{ dataset: string }, {}>(`SELECT DISTINCT dataset FROM ${TABLE}`).all({}).map(d => d.dataset);
+    using delete_ = db.query(`DELETE FROM ${TABLE} WHERE dataset = $dataset AND variant = $variant`);
+    using insert = db.query(`INSERT INTO ${TABLE} (dataset, variant, x, y) VALUES ($dataset, $variant, $x, $y)`);
+
+    console.log(`🚨 Detected ${datasets.length} distinct datasets.`);
+
+    for (const dataset of datasets) {
+      const variants = db.query<{ variant: string }, { $dataset: string }>(`SELECT DISTINCT variant FROM ${TABLE} WHERE dataset = $dataset`).all({ $dataset: dataset }).map(d => d.variant);
+      console.log(`👷 UTC noon aligning ${variants.length} variant${variants.length > 1 ? 's' : ''} in ${dataset}.`);
+
+      for (const variant of variants) {
+        const values = db.query<{ x: number, y: number }, { $variant: string, $dataset: string }>(`SELECT x, y FROM ${TABLE} WHERE dataset = $dataset AND variant = $variant`).all({
+          $dataset: dataset,
+          $variant: variant
+        });
+
+        const nextValues = new Map<number, number>();
+
+        for (const { x, y } of values) {
+          const noon = (Math.floor(x / millisInDay) + 0.5) * millisInDay;
+
+          if (nextValues.has(noon)) {
+            nextValues.set(noon, Math.max(y, nextValues.get(noon)!));
+          } else {
+            nextValues.set(noon, y);
+          }
+        }
+
+        const call = db.transaction((values) => {
+          delete_.run({ $dataset: dataset, $variant: variant });
+
+          for (const [x, y] of values.entries())
+            insert.run({ $dataset: dataset, $variant: variant, $x: x, $y: y });
+        })
+
+        call(nextValues);
+      }
+    }
   }
 }

@@ -2,6 +2,9 @@
   "name": "migrate-timeseries-sum",
   "module": "migrate.ts",
   "type": "module",
+  "scripts": {
+    "dev": "bun ./migrate.ts data.db"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
